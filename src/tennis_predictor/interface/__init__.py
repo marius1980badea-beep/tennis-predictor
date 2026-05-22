@@ -1,1 +1,1 @@
-"""Placeholder for future implementation."""
+"""User-facing interfaces: CLI prediction, dashboards (future)."""
