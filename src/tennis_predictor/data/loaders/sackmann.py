@@ -183,12 +183,43 @@ class SackmannLoader:
 
         _do_sync()
 
+    def extract_player_ids_from_years(self, start_year: int, end_year: int) -> set:
+        """Read match CSVs and extract all unique player IDs that appear as winner or loser.
+
+        Returns:
+            Set of raw Sackmann player IDs (without tour prefix).
+        """
+        all_ids = set()
+        for year in range(start_year, end_year + 1):
+            matches_file = self.cache_dir / f"{self.tour.lower()}_matches_{year}.csv"
+            if not matches_file.exists():
+                continue
+            df = pd.read_csv(
+                matches_file,
+                usecols=["winner_id", "loser_id"],
+                dtype={"winner_id": "string", "loser_id": "string"},
+            )
+            all_ids.update(df["winner_id"].dropna().astype(str).tolist())
+            all_ids.update(df["loser_id"].dropna().astype(str).tolist())
+        logger.info(
+            "player_ids_extracted",
+            tour=self.tour,
+            unique_count=len(all_ids),
+            years=f"{start_year}-{end_year}",
+        )
+        return all_ids
+
+
     # ========================================================================
     # Players
     # ========================================================================
 
-    def load_players(self) -> LoadResult:
-        """Load all players from {tour}_players.csv.
+    def load_players(self, filter_ids: set | None = None) -> LoadResult:
+        """Load players from {tour}_players.csv.
+
+        Args:
+            filter_ids: If provided, only load players whose raw sackmann_id is in this set.
+                       Pass IDs WITHOUT the tour prefix (e.g. "104925", not "atp_104925").
 
         Players file has columns:
             player_id, name_first, name_last, hand, dob, ioc, height, wikidata_id
@@ -199,7 +230,12 @@ class SackmannLoader:
         if not players_file.exists():
             raise FileNotFoundError(f"Players file not found: {players_file}")
 
-        logger.info("loading_players", file=str(players_file), tour=self.tour)
+        logger.info(
+            "loading_players",
+            file=str(players_file),
+            tour=self.tour,
+            filter_count=len(filter_ids) if filter_ids else None,
+        )
 
         df = pd.read_csv(
             players_file,
@@ -208,18 +244,31 @@ class SackmannLoader:
                 "name_first": "string",
                 "name_last": "string",
                 "hand": "string",
-                "dob": "string",  # YYYYMMDD format, parse manually
+                "dob": "string",
                 "ioc": "string",
                 "height": "Int64",
                 "wikidata_id": "string",
             },
         )
 
+        # Filter to only relevant players if filter provided
+        if filter_ids is not None:
+            df = df[df["player_id"].isin(filter_ids)].copy()
+            logger.info("players_filtered", remaining=len(df), tour=self.tour)
+
         # Transform to our schema
         records = []
         for _, row in df.iterrows():
             if pd.isna(row["player_id"]) or pd.isna(row["name_last"]):
                 continue
+
+            height_raw = _safe_int(row.get("height"))
+            # Validate height is realistic (DB constraint: 140-230)
+            height = height_raw if (height_raw and 140 <= height_raw <= 230) else None
+            country = _safe_str(row.get("ioc"))
+            # Validate country code is exactly 3 chars (DB schema)
+            if country and len(country) != 3:
+                country = None
 
             record = {
                 "player_id": f"{self.player_id_prefix}{row['player_id']}",
@@ -228,8 +277,8 @@ class SackmannLoader:
                 "name_last": _safe_str(row["name_last"]),
                 "hand": _normalize_hand(row.get("hand")),
                 "birth_date": _parse_yyyymmdd(row.get("dob")),
-                "country_code": _safe_str(row.get("ioc")),
-                "height_cm": _safe_int(row.get("height")),
+                "country_code": country,
+                "height_cm": height,
             }
             records.append(record)
 
@@ -294,18 +343,39 @@ class SackmannLoader:
 
         rows_inserted = 0
         rows_updated = 0
-        batch_size = 1000
+        batch_size = 500
 
-        with get_session() as session:
+        from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+
+        with Progress(
+            TextColumn("[bold blue]Players:"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeRemainingColumn(),
+        ) as progress:
+            task = progress.add_task("upsert", total=len(records))
+            errors_logged = 0
             for i in range(0, len(records), batch_size):
                 batch = records[i : i + batch_size]
-                for record in batch:
-                    result = session.execute(upsert_sql, record)
-                    row = result.fetchone()
-                    if row and row.inserted:
-                        rows_inserted += 1
-                    else:
-                        rows_updated += 1
+                with get_session() as session:
+                    for record in batch:
+                        try:
+                            with session.begin_nested():
+                                result = session.execute(upsert_sql, record)
+                                row = result.fetchone()
+                                if row and row.inserted:
+                                    rows_inserted += 1
+                                else:
+                                    rows_updated += 1
+                        except Exception as e:
+                            if errors_logged < 5:
+                                logger.warning(
+                                    "player_upsert_error",
+                                    player_id=record.get("player_id"),
+                                    error=str(e)[:200],
+                                )
+                                errors_logged += 1
+                progress.update(task, advance=len(batch))
 
         return rows_inserted, rows_updated
 
@@ -520,9 +590,12 @@ class SackmannLoader:
                 end_date = EXCLUDED.end_date
         """)
 
-        with get_session() as session:
-            for record in records:
-                session.execute(upsert_sql, record)
+        batch_size = 200
+        for i in range(0, len(records), batch_size):
+            batch = records[i : i + batch_size]
+            with get_session() as session:
+                for record in batch:
+                    session.execute(upsert_sql, record)
 
     def _build_match_record(
         self, row: pd.Series, year: int

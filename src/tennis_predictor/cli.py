@@ -152,10 +152,22 @@ def load_data(
                 console.print(f"[red]✗[/red] Sync failed: {e}")
                 continue
 
-        # Step 2: load players
-        console.print("Loading players...")
+        # Step 2: extract player IDs needed for selected years, then load just those
+        console.print(
+            f"Scanning match files {start_year}-{end_year} for unique player IDs..."
+        )
         try:
-            result = loader.load_players()
+            player_ids = loader.extract_player_ids_from_years(start_year, end_year)
+            console.print(
+                f"[green]✓[/green] Found {len(player_ids):,} unique players to load"
+            )
+        except Exception as e:
+            console.print(f"[red]✗[/red] Failed to scan match files: {e}")
+            continue
+
+        console.print("Loading players (filtered to relevant ones)...")
+        try:
+            result = loader.load_players(filter_ids=player_ids)
             console.print(
                 f"[green]✓[/green] Players: {result.rows_inserted} inserted, "
                 f"{result.rows_updated} updated ({result.duration_seconds:.1f}s)"
