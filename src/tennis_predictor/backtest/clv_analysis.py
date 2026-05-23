@@ -1,14 +1,17 @@
 """CLI: compute CLV vs Pinnacle and identify value bets from backtest predictions.
 
-Prerequisite: ``backtest_predictions`` table must be populated. See
-README for how to wire your existing backtest to save predictions.
+Prerequisite:
+  1. Apply migration 011_create_backtest_predictions.sql
+  2. Modify walk_forward.py + run_backtest.py per PATCH instructions
+  3. Re-run backtest with --save flag to populate backtest_predictions
+  4. THEN run this analysis
 
 Usage:
 
-    # Default analysis: latest run for given tour + model_version
+    # Latest run for given tour
     python -m tennis_predictor.backtest.clv_analysis --tour ATP
 
-    # Specific backtest_run_id
+    # Specific backtest_id
     python -m tennis_predictor.backtest.clv_analysis --run-id 3
 
     # Custom value-bet thresholds
@@ -18,17 +21,10 @@ Usage:
     # Export per-prediction CSV
     python -m tennis_predictor.backtest.clv_analysis --tour ATP \\
         --output-csv data/clv_atp.csv
-
-The analysis JOINs:
-    backtest_predictions  (predicted_prob_winner)
-    historical_odds_raw   (Pinnacle winner_odds / winner_implied_prob)
-    matches               (winner_id - to determine which side of the
-                          Pinnacle quote corresponds to the model's pick)
 """
 
 from __future__ import annotations
 
-import csv
 import logging
 from pathlib import Path
 from typing import Optional
@@ -44,29 +40,39 @@ from tennis_predictor.backtest.clv import (
     ValueBetCriteria, compute_clv, compute_edge, is_value_bet,
     summarise_clv,
 )
-from tennis_predictor.data.storage.db import get_engine
+from tennis_predictor.data.storage import get_session
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 
 # ---------------------------------------------------------------------------
-# SQL
+# SQL queries (match real backtest_runs schema: backtest_id, model_version_id)
 # ---------------------------------------------------------------------------
 
-# The key JOIN. For each backtest prediction:
-#   - Pull the matched Pinnacle row from historical_odds_raw (one per match)
-#   - Pinnacle's winner_odds = odds on the actual winner of the match.
-#     This is critical: when comparing CLV, both sides of the comparison
-#     refer to the SAME side of the match (the winner).
-#
-# Notes:
-#   - ``bookmaker_code = 'PS'`` filters to Pinnacle.
-#   - We use INNER JOIN so unmatched predictions (no Pinnacle row) are dropped.
-#   - ``predicted_prob_winner`` is the model's probability for the actual
-#     winner. ``winner_implied_prob`` is Pinnacle's. So CLV is directly
-#     comparable: (predicted - implied) / implied.
+SQL_LATEST_RUN = text("""
+    SELECT br.backtest_id, br.model_version_id, br.run_name, br.completed_at
+    FROM backtest_runs br
+    WHERE (:version IS NULL OR br.model_version_id = :version)
+      AND EXISTS (
+          SELECT 1 FROM backtest_predictions bp
+          WHERE bp.backtest_run_id = br.backtest_id
+            AND (:tour IS NULL OR bp.tour = :tour)
+      )
+    ORDER BY br.completed_at DESC NULLS LAST
+    LIMIT 1
+""")
 
+SQL_RUN_BY_ID = text("""
+    SELECT br.backtest_id, br.model_version_id, br.run_name, br.completed_at
+    FROM backtest_runs br
+    WHERE br.backtest_id = :id
+""")
+
+# For each backtest prediction, find the Pinnacle row for that match.
+# Pinnacle's winner_implied_prob is the implied probability of the actual
+# winner -- same convention as our predicted_prob_winner -- so CLV is
+# directly comparable.
 SQL_LOAD_FOR_CLV = text("""
     SELECT
         bp.prediction_id,
@@ -75,6 +81,7 @@ SQL_LOAD_FOR_CLV = text("""
         bp.was_correct,
         bp.surface,
         bp.tournament_level,
+        bp.tour,
         bp.model_version,
         m.match_date,
         hor.winner_odds          AS pinnacle_winner_odds,
@@ -88,16 +95,8 @@ SQL_LOAD_FOR_CLV = text("""
         ON hor.match_id = bp.match_id
        AND hor.bookmaker_code = 'PS'
     WHERE bp.backtest_run_id = :run_id
+      AND (:tour IS NULL OR bp.tour = :tour)
     ORDER BY m.match_date
-""")
-
-SQL_LATEST_RUN_FOR = text("""
-    SELECT br.run_id, br.model_version, br.tour, br.created_at
-    FROM backtest_runs br
-    WHERE (:tour IS NULL OR br.tour = :tour)
-      AND (:version IS NULL OR br.model_version = :version)
-    ORDER BY br.created_at DESC
-    LIMIT 1
 """)
 
 
@@ -105,48 +104,52 @@ SQL_LATEST_RUN_FOR = text("""
 # Loading
 # ---------------------------------------------------------------------------
 
-def resolve_run_id(
-    engine,
+def resolve_run(
     run_id: int | None,
     tour: str | None,
     version: str | None,
 ) -> tuple[int, str, str]:
-    """Return (run_id, tour, model_version). Raises if nothing found."""
-    if run_id is not None:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT run_id, model_version, tour FROM backtest_runs "
-                     "WHERE run_id = :id"),
-                {"id": run_id},
-            ).first()
-        if row is None:
-            raise click.ClickException(f"No backtest_run with run_id={run_id}")
-        return int(row.run_id), row.tour, row.model_version
+    """Return (backtest_id, model_version_id, run_name).
 
-    with engine.connect() as conn:
-        row = conn.execute(
-            SQL_LATEST_RUN_FOR,
-            {"tour": tour, "version": version},
+    Raises click.ClickException if nothing matches.
+    """
+    with get_session() as session:
+        if run_id is not None:
+            row = session.execute(SQL_RUN_BY_ID, {"id": run_id}).first()
+            if row is None:
+                raise click.ClickException(
+                    f"No backtest_runs row with backtest_id={run_id}"
+                )
+            return int(row.backtest_id), row.model_version_id, row.run_name
+
+        row = session.execute(
+            SQL_LATEST_RUN, {"tour": tour, "version": version},
         ).first()
+
     if row is None:
         raise click.ClickException(
-            f"No backtest_runs match tour={tour}, version={version}. "
-            "Did you run the backtest with prediction-saving enabled?"
+            f"No backtest_runs match tour={tour}, version={version} "
+            "with non-empty backtest_predictions. "
+            "Did you re-run the backtest with --save after applying the "
+            "walk_forward.py patch?"
         )
-    return int(row.run_id), row.tour, row.model_version
+    return int(row.backtest_id), row.model_version_id, row.run_name
 
 
-def load_predictions_with_odds(engine, run_id: int) -> pd.DataFrame:
+def load_predictions_with_odds(run_id: int, tour: str | None) -> pd.DataFrame:
     """Load predictions JOINed with Pinnacle odds for one backtest run."""
-    with engine.connect() as conn:
-        df = pd.read_sql(SQL_LOAD_FOR_CLV, conn, params={"run_id": run_id})
+    with get_session() as session:
+        df = pd.read_sql(
+            SQL_LOAD_FOR_CLV, session.connection(),
+            params={"run_id": run_id, "tour": tour},
+        )
     if not df.empty:
         df["match_date"] = pd.to_datetime(df["match_date"]).dt.date
     return df
 
 
 # ---------------------------------------------------------------------------
-# Per-prediction CLV + value-bet enrichment
+# Per-prediction CLV + value bet enrichment
 # ---------------------------------------------------------------------------
 
 def enrich_with_clv(df: pd.DataFrame, criteria: ValueBetCriteria) -> pd.DataFrame:
@@ -187,10 +190,10 @@ def _year(d) -> int:
     return d.year if hasattr(d, "year") else int(str(d)[:4])
 
 
-def render_overall(df: pd.DataFrame, tour: str, version: str) -> None:
+def render_overall(df: pd.DataFrame, run_name: str, version: str) -> None:
     stats = summarise_clv(df["clv"].tolist(), df["is_value_bet"].tolist())
 
-    table = Table(title=f"CLV Analysis — {tour} / {version}")
+    table = Table(title=f"CLV Analysis — {run_name} / {version}")
     table.add_column("Metric")
     table.add_column("Value", justify="right")
 
@@ -208,20 +211,20 @@ def render_overall(df: pd.DataFrame, tour: str, version: str) -> None:
     console.print(table)
 
     # Headline verdict
-    if stats.mean_clv > 0.005:  # >0.5%
+    if stats.mean_clv > 0.005:
         console.print(
             "\n[bold green]Positive mean CLV detected.[/bold green] "
-            "Model would have beaten Pinnacle closing on average over this run."
+            "Model would have beaten Pinnacle closing on average."
         )
     elif stats.mean_clv > -0.005:
         console.print(
-            "\n[yellow]Mean CLV near zero.[/yellow] Model is line-with-market; "
-            "no systematic edge OR loss vs Pinnacle."
+            "\n[yellow]Mean CLV near zero.[/yellow] Line-with-market; "
+            "no systematic edge or loss vs Pinnacle."
         )
     else:
         console.print(
-            "\n[red]Negative mean CLV.[/red] Model is being out-priced by Pinnacle "
-            "on average. Treat backtest accuracy with appropriate scepticism."
+            "\n[red]Negative mean CLV.[/red] Model is being out-priced by "
+            "Pinnacle on average. Treat backtest accuracy with scepticism."
         )
 
 
@@ -235,13 +238,13 @@ def render_by_dimension(df: pd.DataFrame, dim: str, dim_label: str) -> None:
 
     grouped = df.groupby(dim, dropna=False)
     for key, sub in grouped:
-        if len(sub) < 50:  # too few to be informative
+        if len(sub) < 50:
             continue
         mean = sub["clv"].mean()
         pct_pos = 100 * (sub["clv"] > 0).mean()
         n_vb = int(sub["is_value_bet"].sum())
         table.add_row(
-            str(key) if key else "(unknown)",
+            str(key) if key is not None else "(unknown)",
             f"{len(sub):,}",
             f"{mean * 100:+.2f}%",
             f"{pct_pos:.1f}%",
@@ -251,10 +254,9 @@ def render_by_dimension(df: pd.DataFrame, dim: str, dim_label: str) -> None:
 
 
 def write_per_prediction_csv(df: pd.DataFrame, path: Path) -> None:
-    """Dump enriched predictions to CSV for offline analysis."""
     path.parent.mkdir(parents=True, exist_ok=True)
     cols = [
-        "match_id", "match_date", "surface", "tournament_level",
+        "match_id", "match_date", "surface", "tournament_level", "tour",
         "predicted_prob_winner", "pinnacle_winner_implied",
         "pinnacle_winner_odds", "pinnacle_vig",
         "clv", "edge", "is_value_bet", "was_correct",
@@ -268,11 +270,11 @@ def write_per_prediction_csv(df: pd.DataFrame, path: Path) -> None:
 
 @click.command(name="clv-analyze")
 @click.option("--run-id", type=int, default=None,
-              help="Specific backtest_run_id; otherwise use latest matching")
+              help="Specific backtest_id; otherwise use latest matching")
 @click.option("--tour", type=click.Choice(["ATP", "WTA"]), default=None,
-              help="Filter to a tour (used only when --run-id absent)")
+              help="Filter to a tour")
 @click.option("--version", "model_version", type=str, default=None,
-              help="Filter to a model version (used only when --run-id absent)")
+              help="Filter to a model_version_id (e.g. elo_v1_surface)")
 @click.option("--min-edge", type=float, default=DEFAULT_MIN_EDGE,
               show_default=True)
 @click.option("--min-prob", type=float, default=DEFAULT_MIN_PROB,
@@ -280,7 +282,7 @@ def write_per_prediction_csv(df: pd.DataFrame, path: Path) -> None:
 @click.option("--min-odds", type=float, default=DEFAULT_MIN_ODDS,
               show_default=True)
 @click.option("--output-csv", type=click.Path(path_type=Path), default=None,
-              help="Optional path to write per-prediction enriched CSV")
+              help="Optional path to write per-prediction CSV")
 def clv_analyze_cli(
     run_id: int | None,
     tour: str | None,
@@ -296,41 +298,38 @@ def clv_analyze_cli(
 
     criteria = ValueBetCriteria(min_edge=min_edge, min_prob=min_prob,
                                 min_odds=min_odds)
-    engine = get_engine()
 
-    # Resolve which run to analyse
-    run_id, tour_resolved, version_resolved = resolve_run_id(
-        engine, run_id, tour, model_version,
+    backtest_id, version_resolved, run_name = resolve_run(
+        run_id, tour, model_version,
     )
     console.print(
-        f"[bold]CLV analysis[/bold] for run_id={run_id} "
-        f"({tour_resolved} / {version_resolved}), "
+        f"[bold]CLV analysis[/bold] backtest_id={backtest_id} "
+        f"({run_name} / {version_resolved})\n"
+        f"Tour filter: {tour or 'all'}  |  "
         f"value-bet criteria: edge≥{min_edge:.2f}, prob≥{min_prob:.2f}, "
         f"odds≥{min_odds:.2f}"
     )
 
-    # Load
-    df = load_predictions_with_odds(engine, run_id)
+    df = load_predictions_with_odds(backtest_id, tour)
     if df.empty:
         console.print(
-            f"[red]No predictions JOINable with Pinnacle for run_id={run_id}.[/red]"
+            f"[red]No predictions JOINable with Pinnacle for backtest_id="
+            f"{backtest_id}, tour={tour}.[/red]"
         )
         console.print(
-            "Possible causes: backtest didn't save predictions, or matches "
-            "weren't yet linked to historical_odds_raw (Phase 3.2)."
+            "Possible causes:\n"
+            "  - backtest didn't save predictions (run_backtest --save?)\n"
+            "  - matches not linked to historical_odds_raw (Phase 3.2)\n"
+            "  - this run is for a different tour than --tour"
         )
         return
 
     console.print(f"  Loaded [cyan]{len(df):,}[/cyan] predictions with Pinnacle odds")
 
-    # Enrich
     df = enrich_with_clv(df, criteria)
-
-    # Add year column for time-series analysis
     df["year"] = df["match_date"].apply(_year)
 
-    # Render
-    render_overall(df, tour_resolved, version_resolved)
+    render_overall(df, run_name, version_resolved)
     console.print()
     render_by_dimension(df, "surface", "Surface")
     console.print()

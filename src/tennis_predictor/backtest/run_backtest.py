@@ -11,6 +11,8 @@ Recommendations:
 - Warmup of ~10 years (2000-2010) allows Elo to stabilize
 - Test period 2011-2024 gives 14 years of out-of-sample evaluation
 - Use --save to persist run to backtest_runs table
+- With --save, per-prediction rows are ALSO persisted to backtest_predictions
+  for Phase 3.3 CLV analysis.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from rich.table import Table
 
 from tennis_predictor.backtest.walk_forward import (
     run_walk_forward_backtest,
+    save_backtest_predictions,
     save_backtest_to_db,
 )
 from tennis_predictor.logging_config import setup_logging
@@ -51,7 +54,8 @@ def main() -> None:
     parser.add_argument(
         "--save",
         action="store_true",
-        help="Save results to backtest_runs table",
+        help="Save results to backtest_runs table AND per-prediction rows "
+             "to backtest_predictions (for CLV analysis)",
     )
     parser.add_argument(
         "--notes",
@@ -136,9 +140,20 @@ def main() -> None:
 
     if args.save:
         console.print()
-        console.print("[cyan]Saving backtest to database...[/cyan]")
+        console.print("[cyan]Saving backtest summary to database...[/cyan]")
         backtest_id = save_backtest_to_db(summary, notes=args.notes)
         console.print(f"[green]✓[/green] Saved as backtest_id={backtest_id}")
+
+        console.print("[cyan]Saving per-prediction rows for CLV analysis...[/cyan]")
+        n_inserted = save_backtest_predictions(
+            backtest_id=backtest_id,
+            model_version=args.config_name,
+            predictions=predictions,
+        )
+        console.print(
+            f"[green]✓[/green] Saved {n_inserted:,} predictions "
+            f"to backtest_predictions"
+        )
 
 
 if __name__ == "__main__":

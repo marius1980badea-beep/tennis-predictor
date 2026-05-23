@@ -1,83 +1,71 @@
 -- ============================================================================
 -- Phase 3.3: per-prediction storage for backtest runs
 --
--- The existing `backtest_runs` table only stores aggregate metrics (accuracy,
--- log loss, Brier, etc.). For CLV analysis we need each individual prediction
--- so we can JOIN with `historical_odds_raw` on match_id and compute:
---   - CLV = (predicted_prob - pinnacle_implied_prob) / pinnacle_implied_prob
---   - Edge = predicted_prob * pinnacle_decimal_odds - 1
---   - Value bet flag (edge >= min_edge AND prob >= min_prob AND odds >= min_odds)
+-- One row per (backtest_run_id, match_id). JOINed with historical_odds_raw
+-- in clv_analysis to compute CLV vs Pinnacle.
 --
--- One row per (backtest_run_id, match_id). The `predicted_prob_winner` is
--- the model's probability assigned to the player who ACTUALLY won. This
--- is the convention used by `metrics.py` for log-loss / Brier calculation.
---
--- The corresponding probability for the actual loser is implicit (1.0 -
--- predicted_prob_winner) for binary outcomes.
+-- v2 corrections (after seeing real walk_forward.py / run_backtest.py):
+--   - FK references backtest_runs(backtest_id), NOT a fictional run_id
+--   - model_version stored as TEXT (matches model_versions.model_version_id)
+--   - tour denormalized (backtest_runs has no tour column; it lives in config JSON)
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS backtest_predictions (
-  prediction_id    BIGSERIAL PRIMARY KEY,
+  prediction_id     BIGSERIAL PRIMARY KEY,
 
-  -- Backtest run this prediction belongs to. FK so deleting a run cascades.
-  backtest_run_id  BIGINT NOT NULL REFERENCES backtest_runs(run_id) ON DELETE CASCADE,
+  -- FK to backtest_runs PRIMARY KEY (`backtest_id`, not `run_id`)
+  backtest_run_id   BIGINT NOT NULL REFERENCES backtest_runs(backtest_id) ON DELETE CASCADE,
 
-  -- The match being predicted. NULL only for synthetic test fixtures.
-  match_id         BIGINT REFERENCES matches(match_id),
+  -- The match being predicted
+  match_id          BIGINT REFERENCES matches(match_id),
 
-  -- Model version that produced this prediction (denormalised for fast filtering)
-  model_version    TEXT NOT NULL,
+  -- Model identifier (matches backtest_runs.model_version_id; denormalised
+  -- here so analysis queries can filter without joining backtest_runs)
+  model_version     TEXT NOT NULL,
 
-  -- The probability the model assigned to the actual winner (0-1).
-  -- E.g. if model predicted P(A wins) = 0.6 and A won, this is 0.6.
-  -- If A won but model predicted P(A wins) = 0.3, this is 0.3.
-  -- This matches the convention in walk_forward.py for log loss calculation.
+  -- Tour denormalised from the match (NOT from backtest_runs, which has
+  -- no tour column). Lets us slice CLV analysis without a tournaments JOIN.
+  tour              TEXT NOT NULL CHECK (tour IN ('ATP', 'WTA')),
+
+  -- Probability the model assigned to the actual winner (0..1).
+  -- This matches BacktestPrediction.p_winner_wins in walk_forward.py.
   predicted_prob_winner NUMERIC(7, 6) NOT NULL
     CHECK (predicted_prob_winner BETWEEN 0 AND 1),
 
-  -- Whether the model's argmax prediction was correct (predicted_prob_winner > 0.5)
-  was_correct      BOOLEAN NOT NULL,
+  -- True iff predicted_prob_winner > 0.5 (model picked the actual winner)
+  was_correct       BOOLEAN NOT NULL,
 
-  -- Surface this prediction was made on (denormalised from matches table for
-  -- fast surface-level CLV stratification)
-  surface          TEXT CHECK (surface IN ('Hard', 'Clay', 'Grass', 'Carpet')),
+  -- Surface (denormalised from matches for fast filtering)
+  surface           TEXT CHECK (surface IN ('Hard', 'Clay', 'Grass', 'Carpet')),
 
-  -- Tournament level (G/M/A/D/F/C/S/PM/I/O) - denormalised for slicing
-  tournament_level TEXT,
+  -- Tournament level from tournaments.level (G/M/A/D/F/C/S/PM/I/O)
+  tournament_level  TEXT,
 
-  -- When this row was inserted (for audit trail)
-  predicted_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  predicted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-  -- One prediction per (run, match) - re-running the same backtest replaces
+  -- One prediction per (run, match). Re-running a backtest is a no-op
+  -- via ON CONFLICT DO NOTHING in the insert.
   UNIQUE (backtest_run_id, match_id)
 );
 
--- Indexes for the analysis queries we'll run --------------------------------
+-- Indexes for analysis -------------------------------------------------------
 
--- Quick filter by model_version (avoids touching backtest_runs)
-CREATE INDEX IF NOT EXISTS idx_backtest_predictions_version
-  ON backtest_predictions (model_version, backtest_run_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_predictions_run_tour
+  ON backtest_predictions (backtest_run_id, tour);
 
--- Foreign-table JOINs from historical_odds_raw use match_id
 CREATE INDEX IF NOT EXISTS idx_backtest_predictions_match
   ON backtest_predictions (match_id);
 
--- Surface-level CLV slicing (analysis often groups by surface)
 CREATE INDEX IF NOT EXISTS idx_backtest_predictions_surface
   ON backtest_predictions (backtest_run_id, surface);
 
--- RLS: backend-only access ---------------------------------------------------
+-- RLS
 ALTER TABLE backtest_predictions ENABLE ROW LEVEL SECURITY;
 
 COMMENT ON TABLE backtest_predictions IS
   'Per-prediction output from walk_forward backtest runs (Phase 3.3). '
-  'Used by clv_analysis.py to JOIN with historical_odds_raw and compute '
-  'Closing Line Value vs Pinnacle.';
+  'Populated by save_backtest_predictions() in walk_forward.py. '
+  'JOINed with historical_odds_raw in clv_analysis.py.';
 
 COMMENT ON COLUMN backtest_predictions.predicted_prob_winner IS
-  'Probability the MODEL assigned to the player who actually won. Matches '
-  'the convention in metrics.py log_loss/Brier calculations.';
-
-COMMENT ON COLUMN backtest_predictions.was_correct IS
-  'TRUE iff predicted_prob_winner > 0.5 (model picked the right player at '
-  'argmax). This is a derived field but stored for query speed.';
+  'P(actual winner wins) from the model. Matches BacktestPrediction.p_winner_wins.';

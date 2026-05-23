@@ -59,6 +59,7 @@ class BacktestPrediction:
     match_id: int
     tour: str
     surface: str
+    tournament_level: str | None  # from tournaments.level (G/M/A/D/F/C/...)
 
     winner_id: str
     loser_id: str
@@ -354,6 +355,7 @@ def run_walk_forward_backtest(
                 match_id=row.match_id,
                 tour=row.tour,
                 surface=row.surface,
+                tournament_level=row.tournament_level,
                 winner_id=row.winner_id,
                 loser_id=row.loser_id,
                 p_winner_wins=p_winner,
@@ -505,3 +507,72 @@ def save_backtest_to_db(
 
     logger.info("backtest_saved", backtest_id=backtest_id)
     return backtest_id
+
+
+def save_backtest_predictions(
+    backtest_id: int,
+    model_version: str,
+    predictions: list[BacktestPrediction],
+    batch_size: int = 1000,
+) -> int:
+    """Persist per-prediction rows for CLV analysis (Phase 3.3+).
+
+    The aggregate metrics in `backtest_runs` aren't enough for CLV work --
+    we need each individual prediction to JOIN with `historical_odds_raw`.
+
+    Args:
+        backtest_id: Returned from save_backtest_to_db
+        model_version: e.g. "elo_v1_surface" (matches backtest_runs.model_version_id)
+        predictions: From run_walk_forward_backtest
+        batch_size: Rows per INSERT batch (1000 is fast over the pooler)
+
+    Returns:
+        Number of new rows actually inserted. Re-running the same backtest
+        skips duplicates via ON CONFLICT DO NOTHING.
+    """
+    from sqlalchemy import text
+    from tennis_predictor.data.storage import get_session
+
+    logger = _get_logger()
+    if not predictions:
+        return 0
+
+    insert_sql = text("""
+        INSERT INTO backtest_predictions (
+            backtest_run_id, match_id, model_version, tour,
+            predicted_prob_winner, was_correct,
+            surface, tournament_level
+        ) VALUES (
+            :backtest_run_id, :match_id, :model_version, :tour,
+            :predicted_prob_winner, :was_correct,
+            :surface, :tournament_level
+        )
+        ON CONFLICT (backtest_run_id, match_id) DO NOTHING
+    """)
+
+    rows = [
+        {
+            "backtest_run_id":       backtest_id,
+            "match_id":              p.match_id,
+            "model_version":         model_version,
+            "tour":                  p.tour,
+            "predicted_prob_winner": float(p.p_winner_wins),
+            "was_correct":           p.p_winner_wins > 0.5,
+            "surface":               p.surface,
+            "tournament_level":      p.tournament_level,
+        }
+        for p in predictions
+    ]
+
+    inserted = 0
+    with get_session() as session:
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            result = session.execute(insert_sql, batch)
+            inserted += result.rowcount or 0
+
+    logger.info(
+        "backtest_predictions_saved",
+        backtest_id=backtest_id, n_predictions=len(rows), n_inserted=inserted,
+    )
+    return inserted
