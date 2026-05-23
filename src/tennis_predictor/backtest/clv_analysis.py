@@ -2,9 +2,8 @@
 
 Prerequisite:
   1. Apply migration 011_create_backtest_predictions.sql
-  2. Modify walk_forward.py + run_backtest.py per PATCH instructions
-  3. Re-run backtest with --save flag to populate backtest_predictions
-  4. THEN run this analysis
+  2. Re-run backtest with --save flag to populate backtest_predictions
+  3. THEN run this analysis
 
 Usage:
 
@@ -47,17 +46,23 @@ console = Console()
 
 
 # ---------------------------------------------------------------------------
-# SQL queries (match real backtest_runs schema: backtest_id, model_version_id)
+# SQL queries
+#
+# Note: CAST(:param AS TEXT) is used wherever the same parameter is compared
+# to NULL AND to a column. Without the cast, psycopg/Postgres can't infer
+# the parameter type when the value is None, raising "AmbiguousParameter".
 # ---------------------------------------------------------------------------
 
 SQL_LATEST_RUN = text("""
     SELECT br.backtest_id, br.model_version_id, br.run_name, br.completed_at
     FROM backtest_runs br
-    WHERE (:version IS NULL OR br.model_version_id = :version)
+    WHERE (CAST(:version AS TEXT) IS NULL
+           OR br.model_version_id = CAST(:version AS TEXT))
       AND EXISTS (
           SELECT 1 FROM backtest_predictions bp
           WHERE bp.backtest_run_id = br.backtest_id
-            AND (:tour IS NULL OR bp.tour = :tour)
+            AND (CAST(:tour AS TEXT) IS NULL
+                 OR bp.tour = CAST(:tour AS TEXT))
       )
     ORDER BY br.completed_at DESC NULLS LAST
     LIMIT 1
@@ -69,10 +74,6 @@ SQL_RUN_BY_ID = text("""
     WHERE br.backtest_id = :id
 """)
 
-# For each backtest prediction, find the Pinnacle row for that match.
-# Pinnacle's winner_implied_prob is the implied probability of the actual
-# winner -- same convention as our predicted_prob_winner -- so CLV is
-# directly comparable.
 SQL_LOAD_FOR_CLV = text("""
     SELECT
         bp.prediction_id,
@@ -95,7 +96,7 @@ SQL_LOAD_FOR_CLV = text("""
         ON hor.match_id = bp.match_id
        AND hor.bookmaker_code = 'PS'
     WHERE bp.backtest_run_id = :run_id
-      AND (:tour IS NULL OR bp.tour = :tour)
+      AND (CAST(:tour AS TEXT) IS NULL OR bp.tour = CAST(:tour AS TEXT))
     ORDER BY m.match_date
 """)
 
@@ -130,8 +131,7 @@ def resolve_run(
         raise click.ClickException(
             f"No backtest_runs match tour={tour}, version={version} "
             "with non-empty backtest_predictions. "
-            "Did you re-run the backtest with --save after applying the "
-            "walk_forward.py patch?"
+            "Did you re-run the backtest with --save?"
         )
     return int(row.backtest_id), row.model_version_id, row.run_name
 
@@ -210,7 +210,6 @@ def render_overall(df: pd.DataFrame, run_name: str, version: str) -> None:
 
     console.print(table)
 
-    # Headline verdict
     if stats.mean_clv > 0.005:
         console.print(
             "\n[bold green]Positive mean CLV detected.[/bold green] "
